@@ -2,7 +2,11 @@
   "name": "codex-memo",
   "displayName": "Memo",
   "description": "Git-shared Overleaf-style memos for VS Code workspaces.",
-  "version": "0.0.7",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ChanJoon/memo-extension.git"
+  },
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -13,7 +17,8 @@
   "activationEvents": [
     "onView:codexMemo.memos",
     "onCommand:codexMemo.addMemo",
-    "onCommand:codexMemo.focus"
+    "onCommand:codexMemo.focus",
+    "onCommand:codexMemo.openMemosBeside"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -27,6 +32,11 @@
         "command": "codexMemo.focus",
         "title": "Focus Memos",
         "category": "Memo"
+      },
+      {
+        "command": "codexMemo.openMemosBeside",
+        "title": "Open Memos Beside",
+        "category": "Memo"
       }
     ],
     "configuration": {
@@ -35,7 +45,7 @@
         "codexMemo.authorName": {
           "type": "string",
           "default": "",
-          "description": "Author name to use when git user.name is not available."
+          "description": "Optional label stored on new memos. Blank uses Anonymous."
         },
         "codexMemo.alignment.topOffsetPx": {
           "type": "number",
@@ -67,6 +77,13 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "codexMemo.openMemosBeside",
+          "when": "editorTextFocus",
+          "group": "navigation@20"
+        }
+      ],
       "editor/context": [
         {
           "command": "codexMemo.addMemo",
