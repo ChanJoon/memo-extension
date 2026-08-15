@@ -1,4 +1,4 @@
 codex-memo/node_modules/
 codex-memo/out/
 codex-memo/*.vsix
-.codex-memos/memos.json
+.codex-memos/.memos.json.tmp-*

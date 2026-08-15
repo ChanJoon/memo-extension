@@ -35,7 +35,7 @@ cd codex-memo
 npm install
 npm run compile
 npx --yes @vscode/vsce package --no-dependencies
-code --install-extension codex-memo-0.0.7.vsix --force
+code --install-extension codex-memo-0.1.0.vsix --force
 ```
 
 설치 후 VS Code에서 `Developer: Reload Window` 를 실행 🔁
@@ -53,9 +53,13 @@ code --install-extension codex-memo-0.0.7.vsix --force
 ### 메모 관리
 - 💬 메모 하단 답글 박스로 댓글 추가
 - 🖱️ 메모 카드 클릭 → 해당 코드 위치로 점프
+- 📖 에디터 제목 표시줄의 **Open Memos Beside** 또는 명령 팔레트로 README 미리보기처럼 별도 메모 패널 열기
 - ⋯ 점 세 개 메뉴로 **Edit · Delete**
+- ⋯ 상태 메뉴에서 **Mark Open · Mark In Progress · Mark Resolved** 선택
+- ⋯ 메뉴의 **Copy Context** 로 파일 경로, 선택 코드, 메모, 답글을 클립보드에 복사
 - 🎨 팔레트 버튼으로 메모 색상 변경
-- ✅ 체크 버튼: 루트 메모는 전체 삭제(스레드 포함) · 답글은 해당 답글만 삭제
+- ✅ 체크 버튼: 루트 메모를 `resolved` 상태로 보존하고 다시 열 수 있음 · 답글은 해당 답글만 삭제
+- ⚓ 앵커가 stale이면 현재 에디터에서 코드를 선택한 뒤 **Re-anchor** 로 위치 갱신
 
 ### 검색 & 필터
 - 🔍 상단 검색창으로 통합 검색
@@ -77,7 +81,7 @@ code --install-extension codex-memo-0.0.7.vsix --force
 .codex-memos/memos.json
 ```
 
-> JSON에는 **활성 메모만** 저장되며, 해결(resolve)된 메모는 삭제되어 남지 않습니다.
+> `.codex-memos/memos.json`은 협업을 위해 의도적으로 저장소에 커밋하는 파일입니다. 해결된 메모도 `status: "resolved"`로 기록되어 이력이 보존됩니다. 원자적 저장 중 생성되는 임시 파일만 ignore됩니다.
 
 ```sh
 git add .codex-memos/memos.json codex-memo .gitignore
@@ -87,7 +91,7 @@ git push
 
 1. extension 설치
 2. `git pull` 후, VS Code re-load (`Developer: Reload Window`)
-3. `.codex-memos/memos.json` 이 바뀌면 MEMO sidebar, highlight가 **자동으로 새로고침**🔄
+3. `.codex-memos/memos.json` 이 바뀌면 MEMO sidebar, beside panel, highlight가 **자동으로 새로고침**🔄
 
 ---
 
@@ -109,7 +113,7 @@ git push
 | `lineScale` | 세로 간격 배율 (아래쪽 카드가 더 많이 어긋날 때 조정) |
 | `cardAnchorOffsetPx` | 기준선 대비 카드 위치 보정 |
 
-* `codexMemo.authorName` 으로 git `user.name` 이 없을 때 사용할 작성자 이름을 지정 X
+* `codexMemo.authorName`은 선택적 표시 이름입니다. 비워 두면 새 메모는 `Anonymous`로 저장되며 git 사용자명이나 OS 사용자명을 자동으로 읽지 않습니다.
 
 ---
 

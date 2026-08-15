@@ -1,7 +1,6 @@
 import * as cp from "child_process";
 import * as crypto from "crypto";
 import * as fs from "fs/promises";
-import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 
@@ -11,6 +10,8 @@ type Anchor = {
   endLine: number;
   endCharacter: number;
 };
+
+type MemoStatus = "open" | "in_progress" | "resolved";
 
 type Reply = {
   id: string;
@@ -25,9 +26,12 @@ type Memo = {
   file: string;
   anchor: Anchor;
   selectedText: string;
+  contextBefore?: string;
+  contextAfter?: string;
   body: string;
   author: string;
   color: string;
+  status: MemoStatus;
   createdAt: string;
   updatedAt: string;
   replies: Reply[];
@@ -42,6 +46,8 @@ type Draft = {
   file: string;
   anchor: Anchor;
   selectedText: string;
+  contextBefore: string;
+  contextAfter: string;
   color: string;
   author: string;
 };
@@ -50,7 +56,7 @@ type ViewState = {
   activeFile: string | null;
   memos: Array<Memo & { stale?: boolean }>;
   fileMemos: Array<Memo & { stale?: boolean }>;
-  allMemos: Memo[];
+  allMemos: Array<Memo & { stale?: boolean }>;
   draft: Draft | null;
   focusedMemoId: string | null;
   visibleWindow: VisibleWindow | null;
@@ -70,6 +76,7 @@ type AlignmentSettings = {
 };
 
 const MEMO_FILE_NAME = ".codex-memos/memos.json";
+const MAX_CONTEXT_LENGTH = 240;
 const COLORS = [
   "#3ea8ff",
   "#f59e0b",
@@ -96,7 +103,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("codexMemo.focus", async () => {
       await vscode.commands.executeCommand("codexMemo.memos.focus");
     }),
-    vscode.window.onDidChangeActiveTextEditor(async () => {
+    vscode.commands.registerCommand("codexMemo.openMemosBeside", async () => {
+      await provider.openMemosBeside();
+    }),
+    vscode.window.onDidChangeActiveTextEditor(async (editor) => {
+      provider.rememberEditor(editor);
       await provider.refresh();
     }),
     vscode.window.onDidChangeTextEditorVisibleRanges((event) => {
@@ -117,6 +128,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeWorkspaceFolders(async () => {
       await provider.reloadFromDisk();
     }),
+    provider,
     store,
     decorations
   );
@@ -138,6 +150,7 @@ class MemoStore implements vscode.Disposable {
   private memoFileUri: vscode.Uri | undefined;
   private rootUri: vscode.Uri | undefined;
   private disposed = false;
+  private saveQueue = Promise.resolve();
 
   async initialize(): Promise<void> {
     this.rootUri = await this.resolveMemoRootUri();
@@ -168,7 +181,9 @@ class MemoStore implements vscode.Disposable {
       const parsed = JSON.parse(raw) as Partial<MemoFile>;
       this.data = {
         version: 1,
-        memos: Array.isArray(parsed.memos) ? parsed.memos.filter(isMemo) : []
+        memos: Array.isArray(parsed.memos)
+          ? parsed.memos.map(normalizeMemo).filter((memo): memo is Memo => memo !== null)
+          : []
       };
     } catch {
       this.data = { version: 1, memos: [] };
@@ -180,7 +195,7 @@ class MemoStore implements vscode.Disposable {
     await this.save();
   }
 
-  async updateMemo(id: string, patch: Partial<Pick<Memo, "body" | "color" | "updatedAt" | "replies">>): Promise<void> {
+  async updateMemo(id: string, patch: Partial<Pick<Memo, "anchor" | "selectedText" | "contextBefore" | "contextAfter" | "body" | "color" | "status" | "updatedAt" | "replies">>): Promise<void> {
     const memo = this.data.memos.find((candidate) => candidate.id === id);
     if (!memo) {
       return;
@@ -218,8 +233,16 @@ class MemoStore implements vscode.Disposable {
     if (!this.rootUri) {
       return null;
     }
+    const relativeFile = normalizeMemoFile(memo.file);
+    if (!relativeFile) {
+      return null;
+    }
+    const candidate = path.resolve(this.rootUri.fsPath, ...relativeFile.split("/"));
+    if (!isInsidePath(candidate, this.rootUri.fsPath)) {
+      return null;
+    }
     try {
-      return await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(this.rootUri.fsPath, memo.file)));
+      return await vscode.workspace.openTextDocument(vscode.Uri.file(candidate));
     } catch {
       return null;
     }
@@ -275,25 +298,33 @@ class MemoStore implements vscode.Disposable {
     try {
       await fs.access(this.memoFileUri.fsPath);
     } catch {
-      await fs.writeFile(this.memoFileUri.fsPath, `${JSON.stringify(this.data, null, 2)}\n`, "utf8");
+      await writeAtomic(this.memoFileUri.fsPath, `${JSON.stringify(this.data, null, 2)}\n`);
     }
   }
 
   private async save(): Promise<void> {
-    if (!this.memoFileUri) {
-      void vscode.window.showWarningMessage("Memo storage is unavailable because no workspace folder is open.");
-      return;
-    }
-    await this.ensureFile();
-    await fs.writeFile(this.memoFileUri.fsPath, `${JSON.stringify(this.data, null, 2)}\n`, "utf8");
+    this.saveQueue = this.saveQueue.then(async () => {
+      if (!this.memoFileUri) {
+        void vscode.window.showWarningMessage("Memo storage is unavailable because no workspace folder is open.");
+        return;
+      }
+      await this.ensureFile();
+      await writeAtomic(this.memoFileUri.fsPath, `${JSON.stringify(this.data, null, 2)}\n`);
+    }).catch((error: unknown) => {
+      void vscode.window.showErrorMessage(`Could not save memos: ${error instanceof Error ? error.message : "unknown error"}`);
+    });
+    await this.saveQueue;
   }
 }
 
-class MemoViewProvider implements vscode.WebviewViewProvider {
-  private view: vscode.WebviewView | undefined;
+class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
+  private readonly webviews = new Map<string, vscode.Webview>();
+  private readonly webviewMessages = new Map<string, vscode.Disposable>();
+  private panel: vscode.WebviewPanel | undefined;
   private draft: Draft | null = null;
   private focusedMemoId: string | null = null;
   private lastVisibleKey: string | null = null;
+  private rememberedEditor: vscode.TextEditor | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -301,22 +332,79 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
     private readonly decorations: DecorationManager
   ) {}
 
+  rememberEditor(editor: vscode.TextEditor | undefined): void {
+    if (editor) {
+      this.rememberedEditor = editor;
+    }
+  }
+
+  dispose(): void {
+    const panel = this.panel;
+    this.panel = undefined;
+    for (const disposable of this.webviewMessages.values()) {
+      disposable.dispose();
+    }
+    this.webviewMessages.clear();
+    this.webviews.clear();
+    panel?.dispose();
+  }
+
   resolveWebviewView(webviewView: vscode.WebviewView): void {
-    this.view = webviewView;
-    const webview = webviewView.webview;
+    this.attachWebview("sidebar", webviewView.webview);
+    webviewView.onDidDispose(() => {
+      this.detachWebview("sidebar");
+    });
+  }
+
+  async openMemosBeside(): Promise<void> {
+    // Creating/focusing the webview panel can clear activeTextEditor. Capture
+    // the source editor before VS Code changes focus to the panel.
+    this.rememberEditor(vscode.window.activeTextEditor);
+    if (this.panel) {
+      this.panel.reveal(vscode.ViewColumn.Beside, true);
+      await this.refresh();
+      return;
+    }
+
+    const panel = vscode.window.createWebviewPanel(
+      "codexMemo.memosPanel",
+      "Memos",
+      vscode.ViewColumn.Beside,
+      { enableScripts: true, retainContextWhenHidden: true }
+    );
+    this.panel = panel;
+    this.attachWebview("panel", panel.webview);
+    panel.onDidDispose(() => {
+      this.detachWebview("panel");
+      if (this.panel === panel) {
+        this.panel = undefined;
+      }
+    });
+    await this.refresh();
+  }
+
+  private attachWebview(id: string, webview: vscode.Webview): void {
+    this.detachWebview(id);
     webview.options = {
       enableScripts: true,
       localResourceRoots: [this.extensionUri]
     };
     webview.html = this.getHtml(webview);
-    webview.onDidReceiveMessage((message: unknown) => {
+    this.webviews.set(id, webview);
+    this.webviewMessages.set(id, webview.onDidReceiveMessage((message: unknown) => {
       void this.handleMessage(message);
-    });
+    }));
     void this.refresh();
   }
 
+  private detachWebview(id: string): void {
+    this.webviewMessages.get(id)?.dispose();
+    this.webviewMessages.delete(id);
+    this.webviews.delete(id);
+  }
+
   async createDraftFromSelection(): Promise<void> {
-    const editor = vscode.window.activeTextEditor;
+    const editor = this.getCurrentEditor();
     if (!editor) {
       return;
     }
@@ -334,15 +422,22 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
     }
 
     const author = await resolveAuthorName();
+    const context = getAnchorContext(editor.document, selection);
     this.draft = {
       file,
       anchor: rangeToAnchor(selection),
       selectedText: editor.document.getText(selection),
+      contextBefore: context.before,
+      contextAfter: context.after,
       author,
       color: authorColor(author)
     };
 
-    await vscode.commands.executeCommand("codexMemo.memos.focus");
+    if (this.panel) {
+      this.panel.reveal(vscode.ViewColumn.Beside, false);
+    } else {
+      await vscode.commands.executeCommand("codexMemo.memos.focus");
+    }
     await this.refresh();
     this.post({ type: "focusDraft" });
   }
@@ -353,7 +448,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
   }
 
   async refresh(): Promise<void> {
-    const editor = vscode.window.activeTextEditor;
+    const editor = this.getCurrentEditor();
     if (editor) {
       this.decorations.apply(editor, this.store.getMemosForDocument(editor.document));
     }
@@ -361,7 +456,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
   }
 
   syncToVisibleRange(editor: vscode.TextEditor): void {
-    if (editor !== vscode.window.activeTextEditor || !editor.visibleRanges.length) {
+    if (editor !== this.getCurrentEditor() || !editor.visibleRanges.length) {
       return;
     }
 
@@ -374,7 +469,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async buildState(): Promise<ViewState> {
-    const editor = vscode.window.activeTextEditor;
+    const editor = this.getCurrentEditor();
     if (!editor) {
       return {
         activeFile: null,
@@ -409,8 +504,35 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
+  private getCurrentEditor(): vscode.TextEditor | undefined {
+    const active = vscode.window.activeTextEditor;
+    if (active) {
+      this.rememberedEditor = active;
+      return active;
+    }
+
+    if (this.rememberedEditor) {
+      const rememberedUri = this.rememberedEditor.document.uri.toString();
+      const visible = vscode.window.visibleTextEditors.find(
+        (editor) => editor.document.uri.toString() === rememberedUri
+      );
+      if (visible) {
+        this.rememberedEditor = visible;
+        return visible;
+      }
+    }
+
+    const visible = vscode.window.visibleTextEditors[0];
+    if (visible) {
+      this.rememberedEditor = visible;
+    }
+    return visible;
+  }
+
   private post(message: unknown): void {
-    void this.view?.webview.postMessage(message);
+    for (const webview of this.webviews.values()) {
+      void webview.postMessage(message);
+    }
   }
 
   private async handleMessage(message: unknown): Promise<void> {
@@ -430,9 +552,20 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
         await this.jumpToMemo(String(message.id ?? ""));
         break;
       case "delete":
-      case "resolve":
         await this.store.deleteMemo(String(message.id ?? ""));
         await this.refresh();
+        break;
+      case "resolve":
+        await this.setMemoStatus(String(message.id ?? ""), "resolved");
+        break;
+      case "reopen":
+        await this.setMemoStatus(String(message.id ?? ""), "open");
+        break;
+      case "status":
+        if (!isMemoStatus(message.status)) {
+          return;
+        }
+        await this.setMemoStatus(String(message.id ?? ""), message.status);
         break;
       case "edit":
         await this.editMemo(String(message.id ?? ""), String(message.body ?? ""));
@@ -450,6 +583,12 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
       case "color":
         await this.updateColor(String(message.id ?? ""), String(message.color ?? ""));
         break;
+      case "reanchor":
+        await this.reanchorMemo(String(message.id ?? ""));
+        break;
+      case "copyContext":
+        await this.copyMemoContext(String(message.id ?? ""));
+        break;
     }
   }
 
@@ -466,9 +605,12 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
       file: this.draft.file,
       anchor: this.draft.anchor,
       selectedText: this.draft.selectedText,
+      contextBefore: this.draft.contextBefore,
+      contextAfter: this.draft.contextAfter,
       body: body.trim(),
       author: this.draft.author,
       color: this.draft.color,
+      status: "open",
       createdAt: now,
       updatedAt: now,
       replies: []
@@ -549,7 +691,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async updateColor(id: string, color: string): Promise<void> {
-    if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
+    if (!isValidColor(color)) {
       return;
     }
     await this.store.updateMemo(id, {
@@ -557,6 +699,60 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
       updatedAt: new Date().toISOString()
     });
     await this.refresh();
+  }
+
+  private async setMemoStatus(id: string, status: MemoStatus): Promise<void> {
+    if (!isMemoStatus(status)) {
+      return;
+    }
+    await this.store.updateMemo(id, { status, updatedAt: new Date().toISOString() });
+    await this.refresh();
+  }
+
+  private async reanchorMemo(id: string): Promise<void> {
+    const editor = this.getCurrentEditor();
+    const memo = this.store.getAll().find((candidate) => candidate.id === id);
+    if (!editor || !memo || this.store.toWorkspacePath(editor.document.uri) !== memo.file) {
+      return;
+    }
+    if (editor.selection.isEmpty) {
+      void vscode.window.showInformationMessage("Select the source range before re-anchoring this memo.");
+      return;
+    }
+    const context = getAnchorContext(editor.document, editor.selection);
+    await this.store.updateMemo(id, {
+      anchor: rangeToAnchor(editor.selection),
+      selectedText: editor.document.getText(editor.selection),
+      contextBefore: context.before,
+      contextAfter: context.after,
+      updatedAt: new Date().toISOString()
+    });
+    await this.refresh();
+  }
+
+  private async copyMemoContext(id: string): Promise<void> {
+    const memo = this.store.getAll().find((candidate) => candidate.id === id);
+    if (!memo) {
+      return;
+    }
+    const replies = memo.replies.length === 0
+      ? "(none)"
+      : memo.replies.map((reply) => `${reply.author || "Anonymous"}: ${reply.body}`).join("\n");
+    const context = [
+      `File: ${memo.file}`,
+      "Selected code:",
+      memo.selectedText,
+      "Memo:",
+      memo.body,
+      "Replies:",
+      replies
+    ].join("\n\n");
+    try {
+      await vscode.env.clipboard.writeText(context);
+      void vscode.window.showInformationMessage("Memo context copied to the clipboard.");
+    } catch {
+      void vscode.window.showWarningMessage("Could not copy memo context to the clipboard.");
+    }
   }
 
   private async jumpToMemo(id: string): Promise<void> {
@@ -571,7 +767,11 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
     }
 
     const editor = await vscode.window.showTextDocument(document, { preserveFocus: false });
-    const range = resolveMemoRange(document, memo) ?? anchorToRange(memo.anchor);
+    const range = resolveMemoRange(document, memo);
+    if (!range) {
+      void vscode.window.showWarningMessage("This memo's anchor is stale. Select the current code and use Re-anchor.");
+      return;
+    }
     editor.selection = new vscode.Selection(range.start, range.end);
     editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
     this.focusedMemoId = id;
@@ -757,6 +957,14 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
       color: var(--muted);
       font-size: 11px;
       flex: 0 0 auto;
+    }
+    .status {
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .status.resolved {
+      color: var(--vscode-testing-iconPassed, var(--vscode-charts-green));
     }
     .context {
       color: var(--muted);
@@ -1265,7 +1473,10 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
       meta.querySelector('.date').textContent = formatDate(memo.createdAt);
       header.appendChild(meta);
       header.appendChild(icon('🎨', 'Change color', () => toggleColors(card)));
-      header.appendChild(icon('✓', 'Resolve', () => vscode.postMessage({ type: 'resolve', id: memo.id })));
+      const statusButton = icon(memo.status === 'resolved' ? '↩' : '✓', memo.status === 'resolved' ? 'Reopen' : 'Resolve', () => {
+        vscode.postMessage({ type: 'status', id: memo.id, status: memo.status === 'resolved' ? 'open' : 'resolved' });
+      });
+      header.appendChild(statusButton);
       header.appendChild(menuButton(memo));
       card.appendChild(header);
 
@@ -1291,6 +1502,11 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
       body.className = 'body';
       body.textContent = memo.body;
       card.appendChild(body);
+
+      const status = document.createElement('div');
+      status.className = 'status' + (memo.status === 'resolved' ? ' resolved' : '');
+      status.textContent = memo.status === 'in_progress' ? 'In progress' : memo.status === 'resolved' ? 'Resolved' : 'Open';
+      meta.appendChild(status);
 
       for (const reply of memo.replies) {
         const node = document.createElement('div');
@@ -1341,6 +1557,22 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
         }
         const menu = document.createElement('div');
         menu.className = 'menu';
+        const copy = document.createElement('button');
+        copy.textContent = 'Copy Context';
+        copy.addEventListener('click', () => {
+          menu.remove();
+          vscode.postMessage({ type: 'copyContext', id: memo.id });
+        });
+        for (const [status, label] of [['open', 'Mark Open'], ['in_progress', 'Mark In Progress'], ['resolved', 'Mark Resolved']]) {
+          const statusAction = document.createElement('button');
+          statusAction.textContent = label + (memo.status === status ? ' (current)' : '');
+          statusAction.disabled = memo.status === status;
+          statusAction.addEventListener('click', () => {
+            menu.remove();
+            vscode.postMessage({ type: 'status', id: memo.id, status });
+          });
+          menu.appendChild(statusAction);
+        }
         const edit = document.createElement('button');
         edit.textContent = 'Edit';
         edit.addEventListener('click', () => {
@@ -1353,6 +1585,16 @@ class MemoViewProvider implements vscode.WebviewViewProvider {
         del.className = 'delete';
         del.textContent = 'Delete';
         del.addEventListener('click', () => vscode.postMessage({ type: 'delete', id: memo.id }));
+        menu.insertBefore(copy, menu.firstChild);
+        if (memo.stale) {
+          const reanchor = document.createElement('button');
+          reanchor.textContent = 'Re-anchor';
+          reanchor.addEventListener('click', () => {
+            menu.remove();
+            vscode.postMessage({ type: 'reanchor', id: memo.id });
+          });
+          menu.appendChild(reanchor);
+        }
         menu.append(edit, del);
         wrap.appendChild(menu);
       });
@@ -1556,6 +1798,16 @@ function anchorToRange(anchor: Anchor): vscode.Range {
   );
 }
 
+function getAnchorContext(document: vscode.TextDocument, range: vscode.Range): { before: string; after: string } {
+  const fullText = document.getText();
+  const start = document.offsetAt(range.start);
+  const end = document.offsetAt(range.end);
+  return {
+    before: fullText.slice(Math.max(0, start - MAX_CONTEXT_LENGTH), start),
+    after: fullText.slice(end, Math.min(fullText.length, end + MAX_CONTEXT_LENGTH))
+  };
+}
+
 function resolveMemoRange(document: vscode.TextDocument, memo: Memo): vscode.Range | null {
   const direct = anchorToRange(memo.anchor);
   if (isRangeInsideDocument(document, direct)) {
@@ -1566,21 +1818,74 @@ function resolveMemoRange(document: vscode.TextDocument, memo: Memo): vscode.Ran
   }
 
   const fullText = document.getText();
-  const index = fullText.indexOf(memo.selectedText);
-  if (index < 0) {
+  if (!memo.selectedText) {
     return null;
   }
-  const start = document.positionAt(index);
-  const end = document.positionAt(index + memo.selectedText.length);
-  return new vscode.Range(start, end);
+  const candidates: Array<{
+    range: vscode.Range;
+    contextMatches: number;
+    sharedContext: number;
+    distance: number;
+  }> = [];
+  let index = fullText.indexOf(memo.selectedText);
+  while (index >= 0) {
+    const start = document.positionAt(index);
+    const end = document.positionAt(index + memo.selectedText.length);
+    const range = new vscode.Range(start, end);
+    const before = memo.contextBefore ?? "";
+    const after = memo.contextAfter ?? "";
+    const actualBefore = fullText.slice(Math.max(0, index - before.length), index);
+    const afterEnd = index + memo.selectedText.length;
+    const actualAfter = fullText.slice(afterEnd, afterEnd + after.length);
+    const beforeMatch = Boolean(before) && actualBefore === before;
+    const afterMatch = Boolean(after) && actualAfter === after;
+    candidates.push({
+      range,
+      contextMatches: Number(beforeMatch) + Number(afterMatch),
+      sharedContext: sharedSuffixLength(before, actualBefore) + sharedPrefixLength(after, actualAfter),
+      distance: Math.abs(start.line - memo.anchor.startLine) * 1000
+        + Math.abs(start.character - memo.anchor.startCharacter)
+    });
+    index = fullText.indexOf(memo.selectedText, index + Math.max(1, memo.selectedText.length));
+  }
+  candidates.sort((a, b) => b.contextMatches - a.contextMatches
+    || b.sharedContext - a.sharedContext
+    || a.distance - b.distance);
+  return candidates[0]?.range ?? null;
 }
 
 function isRangeInsideDocument(document: vscode.TextDocument, range: vscode.Range): boolean {
-  if (range.start.line < 0 || range.end.line >= document.lineCount) {
+  if (range.start.line < 0 || range.end.line < range.start.line || range.end.line >= document.lineCount) {
     return false;
   }
+  const startLine = document.lineAt(range.start.line);
   const endLine = document.lineAt(range.end.line);
-  return range.end.character <= endLine.text.length;
+  return range.start.character >= 0
+    && range.end.character >= 0
+    && range.start.character <= startLine.text.length
+    && range.end.character <= endLine.text.length
+    && (range.start.line !== range.end.line || range.start.character <= range.end.character);
+}
+
+function sharedPrefixLength(expected: string, actual: string): number {
+  const length = Math.min(expected.length, actual.length);
+  let index = 0;
+  while (index < length && expected[index] === actual[index]) {
+    index += 1;
+  }
+  return index;
+}
+
+function sharedSuffixLength(expected: string, actual: string): number {
+  let expectedIndex = expected.length - 1;
+  let actualIndex = actual.length - 1;
+  let length = 0;
+  while (expectedIndex >= 0 && actualIndex >= 0 && expected[expectedIndex] === actual[actualIndex]) {
+    expectedIndex -= 1;
+    actualIndex -= 1;
+    length += 1;
+  }
+  return length;
 }
 
 function compareMemoPosition(a: Memo, b: Memo): number {
@@ -1624,37 +1929,11 @@ function getAlignmentSettings(): AlignmentSettings {
 }
 
 async function resolveAuthorName(): Promise<string> {
-  const gitName = await getGitUserName();
-  if (gitName) {
-    return gitName;
-  }
-
   const configured = vscode.workspace.getConfiguration("codexMemo").get<string>("authorName");
   if (configured?.trim()) {
     return configured.trim();
   }
-
-  return os.userInfo().username || "Anonymous";
-}
-
-async function getGitUserName(): Promise<string | null> {
-  const active = vscode.window.activeTextEditor;
-  const activeRoot = active ? await findGitRoot(path.dirname(active.document.uri.fsPath)) : null;
-  const cwd = activeRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!cwd) {
-    return null;
-  }
-
-  return new Promise((resolve) => {
-    cp.execFile("git", ["config", "user.name"], { cwd }, (error, stdout) => {
-      if (error) {
-        resolve(null);
-        return;
-      }
-      const value = stdout.trim();
-      resolve(value || null);
-    });
-  });
+  return "Anonymous";
 }
 
 function authorColor(author: string): string {
@@ -1672,6 +1951,84 @@ function normalizePath(value: string): string {
 function isInsidePath(child: string, parent: string): boolean {
   const relative = path.relative(parent, child);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function normalizeMemoFile(value: string): string | null {
+  const candidate = value.replace(/\\/g, "/");
+  if (!candidate || candidate.includes("\0") || candidate.startsWith("/") || /^[A-Za-z]:\//.test(candidate)) {
+    return null;
+  }
+  const parts = candidate.split("/");
+  if (parts.includes("..")) {
+    return null;
+  }
+  const normalized = path.posix.normalize(candidate);
+  return normalized === "." || normalized.startsWith("../") || path.posix.isAbsolute(normalized)
+    ? null
+    : normalized;
+}
+
+function isValidColor(value: unknown): value is string {
+  return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value);
+}
+
+function isMemoStatus(value: unknown): value is MemoStatus {
+  return value === "open" || value === "in_progress" || value === "resolved";
+}
+
+function normalizeMemo(value: unknown): Memo | null {
+  if (!isRecord(value)
+    || typeof value.id !== "string"
+    || !value.id
+    || typeof value.file !== "string"
+    || !normalizeMemoFile(value.file)
+    || !isAnchor(value.anchor)
+    || typeof value.selectedText !== "string"
+    || !value.selectedText
+    || typeof value.body !== "string"
+    || typeof value.author !== "string"
+    || !isValidColor(value.color)
+    || typeof value.createdAt !== "string"
+    || typeof value.updatedAt !== "string" ) {
+    return null;
+  }
+  const replies = Array.isArray(value.replies) ? value.replies.filter(isReply).map(reply => ({
+    ...reply,
+    author: reply.author.trim() || "Anonymous"
+  })) : [];
+  return {
+    id: value.id,
+    file: normalizeMemoFile(value.file)!,
+    anchor: value.anchor,
+    selectedText: value.selectedText,
+    contextBefore: boundedContext(value.contextBefore, "before"),
+    contextAfter: boundedContext(value.contextAfter, "after"),
+    body: value.body,
+    author: value.author.trim() || "Anonymous",
+    color: value.color,
+    status: isMemoStatus(value.status) ? value.status : "open",
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    replies
+  };
+}
+
+function boundedContext(value: unknown, side: "before" | "after"): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  return side === "before" ? value.slice(-MAX_CONTEXT_LENGTH) : value.slice(0, MAX_CONTEXT_LENGTH);
+}
+
+function isReply(value: unknown): value is Reply {
+  return isRecord(value)
+    && typeof value.id === "string"
+    && value.id.length > 0
+    && typeof value.body === "string"
+    && value.body.length > 0
+    && typeof value.author === "string"
+    && typeof value.createdAt === "string"
+    && typeof value.updatedAt === "string";
 }
 
 async function findGitRoot(startPath: string): Promise<string | null> {
@@ -1739,34 +2096,47 @@ function escapeMarkdown(value: string): string {
   return value.replace(/[\\`*_{}[\]()#+\-.!]/g, "\\$&");
 }
 
-function isMemo(value: unknown): value is Memo {
-  if (!isRecord(value)) {
-    return false;
-  }
-  return typeof value.id === "string"
-    && typeof value.file === "string"
-    && isAnchor(value.anchor)
-    && typeof value.selectedText === "string"
-    && typeof value.body === "string"
-    && typeof value.author === "string"
-    && typeof value.color === "string"
-    && typeof value.createdAt === "string"
-    && typeof value.updatedAt === "string"
-    && Array.isArray(value.replies);
-}
-
 function isAnchor(value: unknown): value is Anchor {
   if (!isRecord(value)) {
     return false;
   }
-  return Number.isInteger(value.startLine)
-    && Number.isInteger(value.startCharacter)
-    && Number.isInteger(value.endLine)
-    && Number.isInteger(value.endCharacter);
+  const startLine = value.startLine;
+  const startCharacter = value.startCharacter;
+  const endLine = value.endLine;
+  const endCharacter = value.endCharacter;
+  return typeof startLine === "number"
+    && typeof startCharacter === "number"
+    && typeof endLine === "number"
+    && typeof endCharacter === "number"
+    && Number.isInteger(startLine)
+    && Number.isInteger(startCharacter)
+    && Number.isInteger(endLine)
+    && Number.isInteger(endCharacter)
+    && startLine >= 0
+    && startCharacter >= 0
+    && endLine >= startLine
+    && endCharacter >= 0
+    && (startLine !== endLine || endCharacter >= startCharacter);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+async function writeAtomic(filePath: string, contents: string): Promise<void> {
+  const directory = path.dirname(filePath);
+  const temporaryPath = path.join(directory, `.memos.json.tmp-${process.pid}-${crypto.randomUUID()}`);
+  try {
+    await fs.writeFile(temporaryPath, contents, "utf8");
+    await fs.rename(temporaryPath, filePath);
+  } catch (error) {
+    try {
+      await fs.unlink(temporaryPath);
+    } catch {
+      // Best-effort cleanup; preserve the original write error.
+    }
+    throw error;
+  }
 }
 
 function debounce(fn: () => void, delay: number): () => void {
