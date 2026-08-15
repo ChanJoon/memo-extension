@@ -2,7 +2,7 @@
   "name": "codex-memo",
   "displayName": "Memo",
   "description": "Git-shared Overleaf-style memos for VS Code workspaces.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/ChanJoon/memo-extension.git"

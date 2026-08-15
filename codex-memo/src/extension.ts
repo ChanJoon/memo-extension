@@ -12,6 +12,7 @@ type Anchor = {
 };
 
 type MemoStatus = "open" | "in_progress" | "resolved";
+type MemoKind = "comment" | "replace" | "delete";
 
 type Reply = {
   id: string;
@@ -26,6 +27,7 @@ type Memo = {
   file: string;
   anchor: Anchor;
   selectedText: string;
+  kind: MemoKind;
   contextBefore?: string;
   contextAfter?: string;
   body: string;
@@ -46,6 +48,7 @@ type Draft = {
   file: string;
   anchor: Anchor;
   selectedText: string;
+  kind: MemoKind;
   contextBefore: string;
   contextAfter: string;
   color: string;
@@ -195,7 +198,7 @@ class MemoStore implements vscode.Disposable {
     await this.save();
   }
 
-  async updateMemo(id: string, patch: Partial<Pick<Memo, "anchor" | "selectedText" | "contextBefore" | "contextAfter" | "body" | "color" | "status" | "updatedAt" | "replies">>): Promise<void> {
+  async updateMemo(id: string, patch: Partial<Pick<Memo, "anchor" | "selectedText" | "kind" | "contextBefore" | "contextAfter" | "body" | "color" | "status" | "updatedAt" | "replies">>): Promise<void> {
     const memo = this.data.memos.find((candidate) => candidate.id === id);
     if (!memo) {
       return;
@@ -427,6 +430,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       file,
       anchor: rangeToAnchor(selection),
       selectedText: editor.document.getText(selection),
+      kind: "comment",
       contextBefore: context.before,
       contextAfter: context.after,
       author,
@@ -490,7 +494,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
         ...memo,
         stale: !resolveMemoRange(editor.document, memo)
       }));
-    const memos = fileMemos.filter((memo) => isMemoVisibleAtStartLine(memo, visibleWindow));
+    const memos = fileMemos.filter((memo) => isMemoVisibleInWindow(memo, visibleWindow));
 
     return {
       activeFile,
@@ -542,7 +546,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
 
     switch (message.type) {
       case "saveDraft":
-        await this.saveDraft(String(message.body ?? ""));
+        await this.saveDraft(String(message.body ?? ""), message.kind);
         break;
       case "cancelDraft":
         this.draft = null;
@@ -566,6 +570,12 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
           return;
         }
         await this.setMemoStatus(String(message.id ?? ""), message.status);
+        break;
+      case "kind":
+        if (!isMemoKind(message.kind)) {
+          return;
+        }
+        await this.setMemoKind(String(message.id ?? ""), message.kind);
         break;
       case "edit":
         await this.editMemo(String(message.id ?? ""), String(message.body ?? ""));
@@ -592,7 +602,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
     }
   }
 
-  private async saveDraft(body: string): Promise<void> {
+  private async saveDraft(body: string, kindValue: unknown): Promise<void> {
     if (!this.draft || !body.trim()) {
       this.draft = null;
       await this.refresh();
@@ -600,11 +610,13 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
     }
 
     const now = new Date().toISOString();
+    const kind = isMemoKind(kindValue) ? kindValue : this.draft.kind;
     const memo: Memo = {
       id: crypto.randomUUID(),
       file: this.draft.file,
       anchor: this.draft.anchor,
       selectedText: this.draft.selectedText,
+      kind,
       contextBefore: this.draft.contextBefore,
       contextAfter: this.draft.contextAfter,
       body: body.trim(),
@@ -709,6 +721,11 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
     await this.refresh();
   }
 
+  private async setMemoKind(id: string, kind: MemoKind): Promise<void> {
+    await this.store.updateMemo(id, { kind, updatedAt: new Date().toISOString() });
+    await this.refresh();
+  }
+
   private async reanchorMemo(id: string): Promise<void> {
     const editor = this.getCurrentEditor();
     const memo = this.store.getAll().find((candidate) => candidate.id === id);
@@ -740,6 +757,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       : memo.replies.map((reply) => `${reply.author || "Anonymous"}: ${reply.body}`).join("\n");
     const context = [
       `File: ${memo.file}`,
+      `Type: ${memoKindLabel(memo.kind)}`,
       "Selected code:",
       memo.selectedText,
       "Memo:",
@@ -958,6 +976,18 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       font-size: 11px;
       flex: 0 0 auto;
     }
+    .kind {
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+    .kind.replace {
+      color: var(--vscode-charts-blue, #3ea8ff);
+    }
+    .kind.delete {
+      color: var(--vscode-errorForeground, #ef4444);
+    }
     .status {
       color: var(--muted);
       font-size: 11px;
@@ -979,6 +1009,16 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       white-space: pre-wrap;
       overflow-wrap: anywhere;
       margin: 6px 0;
+    }
+    .draft-kind {
+      width: 100%;
+      margin-top: 7px;
+      padding: 3px 5px;
+      background: var(--input-bg);
+      color: var(--input-fg);
+      border: 1px solid var(--vscode-input-border, var(--card-border));
+      border-radius: 2px;
+      font: 12px var(--vscode-font-family);
     }
     .reply {
       border-top: 1px solid var(--card-border);
@@ -1435,12 +1475,30 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       card.innerHTML = '<div class="header"><div class="meta"><div class="author"></div><div class="date">Draft</div></div></div><div class="context"></div>';
       card.querySelector('.author').textContent = draft.author;
       card.querySelector('.context').textContent = draft.selectedText;
+      const kindSelect = document.createElement('select');
+      kindSelect.className = 'draft-kind';
+      for (const [value, label] of [['comment', 'Comment'], ['replace', 'Replace'], ['delete', 'Delete']]) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        kindSelect.appendChild(option);
+      }
+      kindSelect.value = draft.kind || 'comment';
+      card.appendChild(kindSelect);
       const input = document.createElement('textarea');
-      input.placeholder = 'Memo';
+      const updatePlaceholder = () => {
+        input.placeholder = kindSelect.value === 'replace'
+          ? 'Replacement wording and/or rationale'
+          : kindSelect.value === 'delete'
+            ? 'Why should this text be deleted?'
+            : 'Memo';
+      };
+      kindSelect.addEventListener('change', updatePlaceholder);
+      updatePlaceholder();
       input.addEventListener('keydown', event => {
         if (event.key === 'Enter' && !event.shiftKey) {
           event.preventDefault();
-          vscode.postMessage({ type: 'saveDraft', body: input.value });
+          vscode.postMessage({ type: 'saveDraft', body: input.value, kind: kindSelect.value });
         }
         if (event.key === 'Escape') {
           event.preventDefault();
@@ -1471,6 +1529,10 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       meta.innerHTML = '<div class="author"></div><div class="date"></div>';
       meta.querySelector('.author').textContent = memo.author;
       meta.querySelector('.date').textContent = formatDate(memo.createdAt);
+      const kind = document.createElement('div');
+      kind.className = 'kind ' + memo.kind;
+      kind.textContent = kindLabel(memo.kind);
+      meta.appendChild(kind);
       header.appendChild(meta);
       header.appendChild(icon('🎨', 'Change color', () => toggleColors(card)));
       const statusButton = icon(memo.status === 'resolved' ? '↩' : '✓', memo.status === 'resolved' ? 'Reopen' : 'Resolve', () => {
@@ -1572,6 +1634,16 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
             vscode.postMessage({ type: 'status', id: memo.id, status });
           });
           menu.appendChild(statusAction);
+        }
+        for (const [kind, label] of [['comment', 'Mark Comment'], ['replace', 'Mark Replace'], ['delete', 'Mark Delete']]) {
+          const kindAction = document.createElement('button');
+          kindAction.textContent = label + (memo.kind === kind ? ' (current)' : '');
+          kindAction.disabled = memo.kind === kind;
+          kindAction.addEventListener('click', () => {
+            menu.remove();
+            vscode.postMessage({ type: 'kind', id: memo.id, kind });
+          });
+          menu.appendChild(kindAction);
         }
         const edit = document.createElement('button');
         edit.textContent = 'Edit';
@@ -1704,6 +1776,10 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       });
     }
 
+    function kindLabel(kind) {
+      return kind === 'replace' ? 'Replace' : kind === 'delete' ? 'Delete' : 'Comment';
+    }
+
   </script>
 </body>
 </html>`;
@@ -1728,31 +1804,35 @@ class DecorationManager implements vscode.Disposable {
       if (!range) {
         continue;
       }
-      const list = grouped.get(memo.color) ?? [];
+      const key = `${memo.kind}:${memo.color}`;
+      const list = grouped.get(key) ?? [];
       list.push({
         range,
-        hoverMessage: new vscode.MarkdownString(`**${escapeMarkdown(memo.author)}**: ${escapeMarkdown(memo.body)}`)
+        hoverMessage: new vscode.MarkdownString(`**${memoKindLabel(memo.kind)} · ${escapeMarkdown(memo.author)}**: ${escapeMarkdown(memo.body)}`)
       });
-      grouped.set(memo.color, list);
+      grouped.set(key, list);
     }
 
-    for (const color of [...this.decorations.keys()]) {
-      if (!grouped.has(color)) {
-        const decoration = this.decorations.get(color);
+    for (const key of [...this.decorations.keys()]) {
+      if (!grouped.has(key)) {
+        const decoration = this.decorations.get(key);
         if (decoration) {
           editor.setDecorations(decoration, []);
         }
       }
     }
 
-    for (const [color, ranges] of grouped) {
-      const decoration = this.getDecoration(color);
+    for (const [key, ranges] of grouped) {
+      const separator = key.indexOf(":");
+      const kind = key.slice(0, separator) as MemoKind;
+      const color = key.slice(separator + 1);
+      const decoration = this.getDecoration(key, kind, color);
       editor.setDecorations(decoration, ranges);
     }
   }
 
-  private getDecoration(color: string): vscode.TextEditorDecorationType {
-    const existing = this.decorations.get(color);
+  private getDecoration(key: string, kind: MemoKind, color: string): vscode.TextEditorDecorationType {
+    const existing = this.decorations.get(key);
     if (existing) {
       return existing;
     }
@@ -1760,6 +1840,7 @@ class DecorationManager implements vscode.Disposable {
     const decoration = vscode.window.createTextEditorDecorationType({
       backgroundColor: alpha(color, "33"),
       border: `1px solid ${alpha(color, "99")}`,
+      textDecoration: kind === "replace" ? "underline" : kind === "delete" ? "line-through" : undefined,
       overviewRulerColor: color,
       overviewRulerLane: vscode.OverviewRulerLane.Right,
       light: {
@@ -1769,7 +1850,7 @@ class DecorationManager implements vscode.Disposable {
         backgroundColor: alpha(color, "38")
       }
     });
-    this.decorations.set(color, decoration);
+    this.decorations.set(key, decoration);
     return decoration;
   }
 }
@@ -1910,11 +1991,11 @@ function getVisibleWindow(editor: vscode.TextEditor): VisibleWindow | null {
   });
 }
 
-function isMemoVisibleAtStartLine(memo: Memo, visibleWindow: VisibleWindow | null): boolean {
+function isMemoVisibleInWindow(memo: Memo, visibleWindow: VisibleWindow | null): boolean {
   if (!visibleWindow) {
     return true;
   }
-  return memo.anchor.startLine >= visibleWindow.startLine
+  return memo.anchor.endLine >= visibleWindow.startLine
     && memo.anchor.startLine <= visibleWindow.endLine;
 }
 
@@ -1976,6 +2057,14 @@ function isMemoStatus(value: unknown): value is MemoStatus {
   return value === "open" || value === "in_progress" || value === "resolved";
 }
 
+function isMemoKind(value: unknown): value is MemoKind {
+  return value === "comment" || value === "replace" || value === "delete";
+}
+
+function memoKindLabel(kind: MemoKind): string {
+  return kind === "replace" ? "Replace" : kind === "delete" ? "Delete" : "Comment";
+}
+
 function normalizeMemo(value: unknown): Memo | null {
   if (!isRecord(value)
     || typeof value.id !== "string"
@@ -2001,6 +2090,7 @@ function normalizeMemo(value: unknown): Memo | null {
     file: normalizeMemoFile(value.file)!,
     anchor: value.anchor,
     selectedText: value.selectedText,
+    kind: isMemoKind(value.kind) ? value.kind : "comment",
     contextBefore: boundedContext(value.contextBefore, "before"),
     contextAfter: boundedContext(value.contextAfter, "after"),
     body: value.body,

@@ -35,7 +35,7 @@ cd codex-memo
 npm install
 npm run compile
 npx --yes @vscode/vsce package --no-dependencies
-code --install-extension codex-memo-0.1.0.vsix --force
+code --install-extension codex-memo-0.2.0.vsix --force
 ```
 
 설치 후 VS Code에서 `Developer: Reload Window` 를 실행 🔁
@@ -48,6 +48,7 @@ code --install-extension codex-memo-0.1.0.vsix --force
 
 ### 메모 작성
 - 📌 에디터에서 텍스트 선택 → `Alt+M` 또는 우클릭 → **`Add Memo`**
+- 🏷️ 작성 중 `Comment` · `Replace` · `Delete` 타입 선택
 - ⌨️ 메모 입력 후 `Enter` 로 저장 · `Esc` 로 취소
 
 ### 메모 관리
@@ -55,6 +56,7 @@ code --install-extension codex-memo-0.1.0.vsix --force
 - 🖱️ 메모 카드 클릭 → 해당 코드 위치로 점프
 - 📖 에디터 제목 표시줄의 **Open Memos Beside** 또는 명령 팔레트로 README 미리보기처럼 별도 메모 패널 열기
 - ⋯ 점 세 개 메뉴로 **Edit · Delete**
+- ⋯ 메뉴에서 저장된 메모의 **Comment · Replace · Delete** 타입 변경
 - ⋯ 상태 메뉴에서 **Mark Open · Mark In Progress · Mark Resolved** 선택
 - ⋯ 메뉴의 **Copy Context** 로 파일 경로, 선택 코드, 메모, 답글을 클립보드에 복사
 - 🎨 팔레트 버튼으로 메모 색상 변경
@@ -68,8 +70,9 @@ code --install-extension codex-memo-0.1.0.vsix --force
 - ➕ #?? 작성시 자동으로 `#tag` 에 추가됨
 
 ### 표시 규칙
-- 👀 현재 에디터에 보이는 줄의 메모만 사이드바에 표시
+- 👀 현재 에디터와 범위가 교차하는 메모를 사이드바에 표시
 - 🪜 카드가 겹치면 아래쪽 카드가 밀려나 모두 읽을 수 있게 배치
+- ✏️ `Replace`는 밑줄, `Delete`는 취소선으로 원문에 표시
 
 ---
 
@@ -82,6 +85,8 @@ code --install-extension codex-memo-0.1.0.vsix --force
 ```
 
 > `.codex-memos/memos.json`은 협업을 위해 의도적으로 저장소에 커밋하는 파일입니다. 해결된 메모도 `status: "resolved"`로 기록되어 이력이 보존됩니다. 원자적 저장 중 생성되는 임시 파일만 ignore됩니다.
+
+각 메모는 `kind: "comment" | "replace" | "delete"`를 가질 수 있습니다. 기존 `kind`가 없는 메모는 `comment`로 읽습니다. `replace`와 `delete`는 원문을 자동으로 수정하지 않고, 선택된 원문과 메모 본문을 검토 제안으로 공유합니다.
 
 ```sh
 git add .codex-memos/memos.json codex-memo .gitignore
