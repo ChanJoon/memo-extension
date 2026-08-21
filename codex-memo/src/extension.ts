@@ -494,13 +494,19 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
         ...memo,
         stale: !resolveMemoRange(editor.document, memo)
       }));
-    const memos = fileMemos.filter((memo) => isMemoVisibleInWindow(memo, visibleWindow));
+    const memos = fileMemos.filter((memo) => memo.stale || isMemoVisibleInWindow(memo, visibleWindow));
+    const allMemos = this.store.getAll()
+      .sort(compareMemoFileAndPosition)
+      .map((memo) => ({
+        ...memo,
+        stale: memo.file === activeFile ? !resolveMemoRange(editor.document, memo) : false
+      }));
 
     return {
       activeFile,
       memos,
       fileMemos,
-      allMemos: this.store.getAll().sort(compareMemoFileAndPosition),
+      allMemos,
       draft: this.draft?.file === activeFile ? this.draft : null,
       focusedMemoId: this.focusedMemoId,
       visibleWindow,
@@ -935,6 +941,12 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       margin: 0;
       padding: 8px 7px 8px 8px;
     }
+    .memo-content {
+      max-height: min(65vh, 520px);
+      overflow-x: hidden;
+      overflow-y: auto;
+      scrollbar-gutter: stable;
+    }
     .board .memo {
       position: absolute;
       left: 0;
@@ -948,12 +960,15 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       outline: 1px solid var(--vscode-focusBorder);
       outline-offset: -1px;
     }
+    .memo.menu-open {
+      z-index: 20;
+    }
     .memo.stale {
       opacity: 0.72;
     }
     .header {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       gap: 4px;
       align-items: start;
     }
@@ -977,10 +992,15 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       flex: 0 0 auto;
     }
     .kind {
+      appearance: none;
+      background: transparent;
+      border: 0;
       color: var(--muted);
+      cursor: pointer;
       font-size: 11px;
       white-space: nowrap;
       flex: 0 0 auto;
+      padding: 0;
     }
     .kind.replace {
       color: var(--vscode-charts-blue, #3ea8ff);
@@ -989,9 +1009,15 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       color: var(--vscode-errorForeground, #ef4444);
     }
     .status {
+      appearance: none;
+      background: transparent;
+      border: 0;
       color: var(--muted);
+      cursor: pointer;
       font-size: 11px;
       white-space: nowrap;
+      flex: 0 0 auto;
+      padding: 0;
     }
     .status.resolved {
       color: var(--vscode-testing-iconPassed, var(--vscode-charts-green));
@@ -1010,15 +1036,51 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       overflow-wrap: anywhere;
       margin: 6px 0;
     }
-    .draft-kind {
-      width: 100%;
-      margin-top: 7px;
-      padding: 3px 5px;
+    .choice-panel {
+      display: grid;
+      gap: 5px;
+      margin: 5px 0 6px;
+      padding: 6px;
+      border: 1px solid var(--card-border);
       background: var(--input-bg);
+    }
+    .choice-row {
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr);
+      gap: 6px;
+      align-items: center;
+    }
+    .choice-label {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .segmented {
+      display: flex;
+      min-width: 0;
+      gap: 2px;
+    }
+    .segment {
+      appearance: none;
+      flex: 1 1 0;
+      min-width: 0;
+      padding: 3px 5px;
+      overflow: hidden;
+      background: transparent;
       color: var(--input-fg);
-      border: 1px solid var(--vscode-input-border, var(--card-border));
+      border: 1px solid var(--card-border);
       border-radius: 2px;
-      font: 12px var(--vscode-font-family);
+      cursor: pointer;
+      font: 11px var(--vscode-font-family);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .segment:hover,
+    .segment.selected {
+      background: var(--button-hover);
+      border-color: var(--vscode-focusBorder, var(--card-border));
+    }
+    .draft .choice-panel {
+      margin-top: 7px;
     }
     .reply {
       border-top: 1px solid var(--card-border);
@@ -1146,6 +1208,8 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       visibleWindow: null,
       alignment: { topOffsetPx: 0, lineHeightPx: 0, lineScale: 1, cardAnchorOffsetPx: 0 }
     };
+    let lastAutoScrollKey = null;
+    let lastRenderedFile = null;
     let ui = {
       query: '',
       scope: 'file',
@@ -1180,6 +1244,9 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
     });
 
     function render() {
+      const previousBoard = document.querySelector('.board');
+      const preserveScroll = lastRenderedFile === state.activeFile;
+      const previousScrollTop = preserveScroll ? previousBoard?.scrollTop || 0 : 0;
       root.innerHTML = '';
       root.appendChild(renderToolbar());
       root.appendChild(renderFilterPanel());
@@ -1215,7 +1282,26 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       const spacer = document.createElement('div');
       spacer.className = 'board-spacer';
       board.appendChild(spacer);
-      requestAnimationFrame(() => layoutCards(board, spacer));
+      lastRenderedFile = state.activeFile;
+      requestAnimationFrame(() => {
+        layoutCards(board, spacer);
+        const target = state.draft
+          ? board.querySelector('[data-draft]')
+          : state.focusedMemoId
+            ? board.querySelector('[data-id="' + state.focusedMemoId + '"]')
+            : null;
+        const targetKey = state.draft
+          ? 'draft:' + state.draft.file + ':' + state.draft.anchor.startLine + ':' + state.draft.anchor.startCharacter
+          : state.focusedMemoId
+            ? 'memo:' + state.activeFile + ':' + state.focusedMemoId
+            : null;
+        if (target && targetKey && targetKey !== lastAutoScrollKey) {
+          lastAutoScrollKey = targetKey;
+          scrollCardIntoView(board, target);
+        } else {
+          board.scrollTop = previousScrollTop;
+        }
+      });
     }
 
     function renderToolbar() {
@@ -1284,7 +1370,13 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       panel.className = 'filter-panel' + (ui.filterOpen ? ' open' : '');
 
       const type = document.createElement('select');
-      for (const [value, label] of [['tag', '#tag'], ['color', '#color'], ['user', '#user']]) {
+      for (const [value, label] of [
+        ['kind', 'Type'],
+        ['status', 'Status'],
+        ['tag', '#tag'],
+        ['color', '#color'],
+        ['user', '#user']
+      ]) {
         const option = document.createElement('option');
         option.value = value;
         option.textContent = label;
@@ -1315,7 +1407,6 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       clear.textContent = '×';
       clear.addEventListener('click', () => {
         ui.filterValue = '';
-        ui.query = '';
         render();
       });
 
@@ -1329,9 +1420,13 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       root.appendChild(results);
 
       const memos = filteredMemos();
-      if (memos.length === 0) {
+      const draft = state.draft && draftMatchesFilters(state.draft) ? state.draft : null;
+      if (!draft && memos.length === 0) {
         results.appendChild(empty('No matching memos.'));
         return;
+      }
+      if (draft) {
+        results.appendChild(renderDraft(draft));
       }
       memos.forEach((memo, index) => {
         results.appendChild(renderMemo(memo, { showFile: ui.scope === 'all', order: index }));
@@ -1355,6 +1450,12 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
         if (ui.filterType === 'tag') {
           return memoTags(memo).includes(ui.filterValue);
         }
+        if (ui.filterType === 'kind') {
+          return memo.kind === ui.filterValue;
+        }
+        if (ui.filterType === 'status') {
+          return memo.status === ui.filterValue;
+        }
         if (ui.filterType === 'color') {
           return memo.color.toLowerCase() === ui.filterValue;
         }
@@ -1365,12 +1466,39 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       });
     }
 
+    function draftMatchesFilters(draft) {
+      const query = ui.query.trim().toLowerCase();
+      if (query && ![draft.file, draft.selectedText, draft.author].join(' ').toLowerCase().includes(query)) {
+        return false;
+      }
+      if (!ui.filterValue) {
+        return true;
+      }
+      if (ui.filterType === 'kind') {
+        return draft.kind === ui.filterValue;
+      }
+      if (ui.filterType === 'status') {
+        return ui.filterValue === 'open';
+      }
+      if (ui.filterType === 'color') {
+        return draft.color.toLowerCase() === ui.filterValue;
+      }
+      if (ui.filterType === 'user') {
+        return draft.author === ui.filterValue;
+      }
+      return false;
+    }
+
     function filterOptions(type) {
       const source = ui.scope === 'all' ? state.allMemos : state.fileMemos;
       const values = new Set();
       for (const memo of source) {
         if (type === 'tag') {
           memoTags(memo).forEach(value => values.add(value));
+        } else if (type === 'kind') {
+          values.add(memo.kind);
+        } else if (type === 'status') {
+          values.add(memo.status);
         } else if (type === 'color') {
           values.add(memo.color.toLowerCase());
         } else if (type === 'user') {
@@ -1383,6 +1511,12 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
     function optionLabel(type, value) {
       if (type === 'tag') {
         return value;
+      }
+      if (type === 'kind') {
+        return kindLabel(value);
+      }
+      if (type === 'status') {
+        return statusLabel(value);
       }
       if (type === 'color') {
         return value;
@@ -1467,6 +1601,18 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
     }
 
+    function scrollCardIntoView(board, card) {
+      const top = card.offsetTop;
+      const bottom = top + card.offsetHeight;
+      const visibleTop = board.scrollTop;
+      const visibleBottom = visibleTop + board.clientHeight;
+      if (top >= visibleTop && bottom <= visibleBottom) {
+        return;
+      }
+      const centeredTop = top - Math.max(0, (board.clientHeight - card.offsetHeight) / 2);
+      board.scrollTo({ top: Math.max(0, centeredTop), behavior: 'smooth' });
+    }
+
     function renderDraft(draft) {
       const card = document.createElement('section');
       card.className = 'memo draft';
@@ -1475,30 +1621,24 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       card.innerHTML = '<div class="header"><div class="meta"><div class="author"></div><div class="date">Draft</div></div></div><div class="context"></div>';
       card.querySelector('.author').textContent = draft.author;
       card.querySelector('.context').textContent = draft.selectedText;
-      const kindSelect = document.createElement('select');
-      kindSelect.className = 'draft-kind';
-      for (const [value, label] of [['comment', 'Comment'], ['replace', 'Replace'], ['delete', 'Delete']]) {
-        const option = document.createElement('option');
-        option.value = value;
-        option.textContent = label;
-        kindSelect.appendChild(option);
-      }
-      kindSelect.value = draft.kind || 'comment';
-      card.appendChild(kindSelect);
+      let selectedKind = draft.kind || 'comment';
       const input = document.createElement('textarea');
       const updatePlaceholder = () => {
-        input.placeholder = kindSelect.value === 'replace'
+        input.placeholder = selectedKind === 'replace'
           ? 'Replacement wording and/or rationale'
-          : kindSelect.value === 'delete'
+          : selectedKind === 'delete'
             ? 'Why should this text be deleted?'
             : 'Memo';
       };
-      kindSelect.addEventListener('change', updatePlaceholder);
+      card.appendChild(choiceGroup('Type', [['comment', 'Comment'], ['replace', 'Replace'], ['delete', 'Delete']], selectedKind, value => {
+        selectedKind = value;
+        updatePlaceholder();
+      }));
       updatePlaceholder();
       input.addEventListener('keydown', event => {
         if (event.key === 'Enter' && !event.shiftKey) {
           event.preventDefault();
-          vscode.postMessage({ type: 'saveDraft', body: input.value, kind: kindSelect.value });
+          vscode.postMessage({ type: 'saveDraft', body: input.value, kind: selectedKind });
         }
         if (event.key === 'Escape') {
           event.preventDefault();
@@ -1515,12 +1655,6 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       card.dataset.id = memo.id;
       card.dataset.order = String(options.order ?? 0);
       card.style.setProperty('--memo-color', memo.color);
-      card.addEventListener('click', event => {
-        if (event.target.closest('button, textarea, .menu, .swatch')) {
-          return;
-        }
-        vscode.postMessage({ type: 'jump', id: memo.id });
-      });
 
       const header = document.createElement('div');
       header.className = 'header';
@@ -1529,16 +1663,10 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       meta.innerHTML = '<div class="author"></div><div class="date"></div>';
       meta.querySelector('.author').textContent = memo.author;
       meta.querySelector('.date').textContent = formatDate(memo.createdAt);
-      const kind = document.createElement('div');
-      kind.className = 'kind ' + memo.kind;
-      kind.textContent = kindLabel(memo.kind);
-      meta.appendChild(kind);
+      meta.appendChild(choiceBadge(kindLabel(memo.kind), 'kind ' + memo.kind, () => toggleChoicePanel(card, memo)));
+      meta.appendChild(choiceBadge(statusLabel(memo.status), 'status' + (memo.status === 'resolved' ? ' resolved' : ''), () => toggleChoicePanel(card, memo)));
       header.appendChild(meta);
       header.appendChild(icon('🎨', 'Change color', () => toggleColors(card)));
-      const statusButton = icon(memo.status === 'resolved' ? '↩' : '✓', memo.status === 'resolved' ? 'Reopen' : 'Resolve', () => {
-        vscode.postMessage({ type: 'status', id: memo.id, status: memo.status === 'resolved' ? 'open' : 'resolved' });
-      });
-      header.appendChild(statusButton);
       header.appendChild(menuButton(memo));
       card.appendChild(header);
 
@@ -1554,21 +1682,18 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       }
       card.appendChild(colorList);
 
+      const content = document.createElement('div');
+      content.className = 'memo-content';
       const context = document.createElement('div');
       context.className = 'context';
       const prefix = options.showFile ? memo.file + ':' + (memo.anchor.startLine + 1) + ' - ' : '';
       context.textContent = prefix + (memo.stale ? 'Stale anchor: ' + memo.selectedText : memo.selectedText);
-      card.appendChild(context);
+      content.appendChild(context);
 
       const body = document.createElement('div');
       body.className = 'body';
       body.textContent = memo.body;
-      card.appendChild(body);
-
-      const status = document.createElement('div');
-      status.className = 'status' + (memo.status === 'resolved' ? ' resolved' : '');
-      status.textContent = memo.status === 'in_progress' ? 'In progress' : memo.status === 'resolved' ? 'Resolved' : 'Open';
-      meta.appendChild(status);
+      content.appendChild(body);
 
       for (const reply of memo.replies) {
         const node = document.createElement('div');
@@ -1588,7 +1713,7 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
         replyHeader.appendChild(icon('✓', 'Resolve reply', () => vscode.postMessage({ type: 'resolveReply', id: memo.id, replyId: reply.id })));
         replyHeader.appendChild(replyMenuButton(memo, reply));
         node.appendChild(replyHeader);
-        card.appendChild(node);
+        content.appendChild(node);
       }
 
       const reply = document.createElement('textarea');
@@ -1604,8 +1729,81 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
           reply.blur();
         }
       });
-      card.appendChild(reply);
+      content.appendChild(reply);
+      card.appendChild(content);
       return card;
+    }
+
+    function choiceBadge(label, className, onClick) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = className;
+      button.textContent = label;
+      button.title = 'Change';
+      button.addEventListener('click', event => {
+        event.stopPropagation();
+        onClick();
+      });
+      return button;
+    }
+
+    function toggleChoicePanel(card, memo) {
+      const existing = card.querySelector('.choice-panel');
+      if (existing) {
+        existing.remove();
+        return;
+      }
+
+      const panel = document.createElement('div');
+      panel.className = 'choice-panel';
+      panel.addEventListener('click', event => event.stopPropagation());
+      const close = () => panel.remove();
+      panel.appendChild(choiceGroup('Type', [['comment', 'Comment'], ['replace', 'Replace'], ['delete', 'Delete']], memo.kind, kind => {
+        close();
+        vscode.postMessage({ type: 'kind', id: memo.id, kind });
+      }));
+      panel.appendChild(choiceGroup('Status', [['open', 'Open'], ['in_progress', 'In progress'], ['resolved', 'Resolved']], memo.status, status => {
+        close();
+        vscode.postMessage({ type: 'status', id: memo.id, status });
+      }));
+      const colorList = card.querySelector('.colors');
+      if (colorList) {
+        card.insertBefore(panel, colorList);
+      } else {
+        card.appendChild(panel);
+      }
+    }
+
+    function choiceGroup(label, options, current, onSelect) {
+      const row = document.createElement('div');
+      row.className = 'choice-row';
+      const name = document.createElement('span');
+      name.className = 'choice-label';
+      name.textContent = label;
+      row.appendChild(name);
+      const group = document.createElement('div');
+      group.className = 'segmented';
+      const buttons = [];
+      for (const [value, text] of options) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'segment' + (value === current ? ' selected' : '');
+        button.textContent = text;
+        button.setAttribute('aria-pressed', String(value === current));
+        button.addEventListener('click', () => {
+          for (const candidate of buttons) {
+            candidate.classList.remove('selected');
+            candidate.setAttribute('aria-pressed', 'false');
+          }
+          button.classList.add('selected');
+          button.setAttribute('aria-pressed', 'true');
+          onSelect(value);
+        });
+        buttons.push(button);
+        group.appendChild(button);
+      }
+      row.appendChild(group);
+      return row;
     }
 
     function menuButton(memo) {
@@ -1615,54 +1813,49 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
         const existing = wrap.querySelector('.menu');
         if (existing) {
           existing.remove();
+          wrap.closest('.memo')?.classList.remove('menu-open');
           return;
         }
         const menu = document.createElement('div');
         menu.className = 'menu';
+        const closeMenu = () => {
+          menu.remove();
+          wrap.closest('.memo')?.classList.remove('menu-open');
+        };
+        wrap.closest('.memo')?.classList.add('menu-open');
         const copy = document.createElement('button');
         copy.textContent = 'Copy Context';
         copy.addEventListener('click', () => {
-          menu.remove();
+          closeMenu();
           vscode.postMessage({ type: 'copyContext', id: memo.id });
         });
-        for (const [status, label] of [['open', 'Mark Open'], ['in_progress', 'Mark In Progress'], ['resolved', 'Mark Resolved']]) {
-          const statusAction = document.createElement('button');
-          statusAction.textContent = label + (memo.status === status ? ' (current)' : '');
-          statusAction.disabled = memo.status === status;
-          statusAction.addEventListener('click', () => {
-            menu.remove();
-            vscode.postMessage({ type: 'status', id: memo.id, status });
-          });
-          menu.appendChild(statusAction);
-        }
-        for (const [kind, label] of [['comment', 'Mark Comment'], ['replace', 'Mark Replace'], ['delete', 'Mark Delete']]) {
-          const kindAction = document.createElement('button');
-          kindAction.textContent = label + (memo.kind === kind ? ' (current)' : '');
-          kindAction.disabled = memo.kind === kind;
-          kindAction.addEventListener('click', () => {
-            menu.remove();
-            vscode.postMessage({ type: 'kind', id: memo.id, kind });
-          });
-          menu.appendChild(kindAction);
-        }
+        const jump = document.createElement('button');
+        jump.textContent = 'Jump to source';
+        jump.addEventListener('click', () => {
+          closeMenu();
+          vscode.postMessage({ type: 'jump', id: memo.id });
+        });
         const edit = document.createElement('button');
         edit.textContent = 'Edit';
         edit.addEventListener('click', () => {
-          menu.remove();
+          closeMenu();
           startInlineEdit(wrap.closest('.memo').querySelector('.body'), memo.body, next => {
             vscode.postMessage({ type: 'edit', id: memo.id, body: next });
           });
         });
         const del = document.createElement('button');
         del.className = 'delete';
-        del.textContent = 'Delete';
-        del.addEventListener('click', () => vscode.postMessage({ type: 'delete', id: memo.id }));
-        menu.insertBefore(copy, menu.firstChild);
+        del.textContent = 'Delete memo';
+        del.addEventListener('click', () => {
+          closeMenu();
+          vscode.postMessage({ type: 'delete', id: memo.id });
+        });
+        menu.append(copy, jump);
         if (memo.stale) {
           const reanchor = document.createElement('button');
           reanchor.textContent = 'Re-anchor';
           reanchor.addEventListener('click', () => {
-            menu.remove();
+            closeMenu();
             vscode.postMessage({ type: 'reanchor', id: memo.id });
           });
           menu.appendChild(reanchor);
@@ -1778,6 +1971,10 @@ class MemoViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
 
     function kindLabel(kind) {
       return kind === 'replace' ? 'Replace' : kind === 'delete' ? 'Delete' : 'Comment';
+    }
+
+    function statusLabel(status) {
+      return status === 'in_progress' ? 'In progress' : status === 'resolved' ? 'Resolved' : 'Open';
     }
 
   </script>

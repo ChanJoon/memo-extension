@@ -53,11 +53,11 @@ code --install-extension codex-memo-0.2.0.vsix --force
 
 ### 메모 관리
 - 💬 메모 하단 답글 박스로 댓글 추가
-- 🖱️ 메모 카드 클릭 → 해당 코드 위치로 점프
+- 🖱️ 메모 카드의 ⋯ 메뉴에서 **Jump to source** → 해당 코드 위치로 점프
 - 📖 에디터 제목 표시줄의 **Open Memos Beside** 또는 명령 팔레트로 README 미리보기처럼 별도 메모 패널 열기
-- ⋯ 점 세 개 메뉴로 **Edit · Delete**
-- ⋯ 메뉴에서 저장된 메모의 **Comment · Replace · Delete** 타입 변경
-- ⋯ 상태 메뉴에서 **Mark Open · Mark In Progress · Mark Resolved** 선택
+- 카드 상단의 **Comment · Replace · Delete** 배지를 클릭해 타입 변경
+- 카드 상단의 **Open · In progress · Resolved** 배지를 클릭해 상태 변경
+- ⋯ 점 세 개 메뉴로 **Edit · Copy Context · Re-anchor · Delete memo**
 - ⋯ 메뉴의 **Copy Context** 로 파일 경로, 선택 코드, 메모, 답글을 클립보드에 복사
 - 🎨 팔레트 버튼으로 메모 색상 변경
 - ✅ 체크 버튼: 루트 메모를 `resolved` 상태로 보존하고 다시 열 수 있음 · 답글은 해당 답글만 삭제
@@ -66,7 +66,7 @@ code --install-extension codex-memo-0.2.0.vsix --force
 ### 검색 & 필터
 - 🔍 상단 검색창으로 통합 검색
 - 🌐 검색창 옆 범위 아이콘으로 현재 파일 ↔ 전체 파일 전환
-- 🧹 필터 아이콘으로 `#tag` · `#color` · `#user` 필터링
+- 🧹 필터 아이콘으로 타입(`Comment` · `Replace` · `Delete`) · 상태(`Open` · `In progress` · `Resolved`) · `#tag` · `#color` · `#user` 필터링
 - ➕ #?? 작성시 자동으로 `#tag` 에 추가됨
 
 ### 표시 규칙
